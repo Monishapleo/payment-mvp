@@ -1,3 +1,4 @@
+/*
 package com.paymentguard.payment.service;
 
 import java.math.BigDecimal;
@@ -11,7 +12,8 @@ public class SimulatedPaymentProvider implements PaymentProvider {
         return new ProviderResult("PROV-" + UUID.randomUUID(), true);
     }
 
-    public ProviderResult getStatus(String ref) {
+    public ProviderResult getStatus(Long paymentId,String ref) {
         return new ProviderResult(ref, true);
     }
 }
+*/

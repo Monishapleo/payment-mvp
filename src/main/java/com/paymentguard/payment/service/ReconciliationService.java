@@ -32,7 +32,7 @@ public class ReconciliationService {
             }
 
             PaymentProvider.ProviderResult result =
-                    paymentProvider.getStatus(
+                    paymentProvider.getStatus(payment.getId(),
                             payment.getProviderReference()
                     );
 

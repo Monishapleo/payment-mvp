@@ -24,6 +24,7 @@ public class PaymentService {
     private final PaymentRepository paymentRepository;
     private final OrderRepository orderRepository;
     private final PaymentProvider paymentProvider;
+    private final PaymentTransactionService paymentTransactionService;
 
     @Transactional
     public PaymentResponse create(
@@ -39,144 +40,33 @@ public class PaymentService {
             );
         }
 
-        Payment payment = claimPayment(
-                userId,
-                request,
-                idempotencyKey
-        );
+        PaymentTransactionService.ClaimResult result =
+                paymentTransactionService.claimPayment(
+                        userId,
+                        request,
+                        idempotencyKey
+                );
 
-        /*
-         * Existing payment means this is an idempotent retry.
-         */
-        if (payment.getStatus() != PaymentStatus.IN_PROGRESS) {
+        Payment payment = result.payment();
+
+        // Existing payment = idempotent retry.
+        // NEVER call provider again.
+        if (!result.newlyCreated()) {
             return toResponse(payment);
         }
 
         processPayment(payment.getId());
 
-        Payment completedPayment = paymentRepository
-                .findById(payment.getId())
-                .orElseThrow(() -> new ApiException(
-                        HttpStatus.INTERNAL_SERVER_ERROR.value(),
-                        "Payment not found after processing"
-                ));
+        Payment completedPayment =
+                paymentRepository.findById(payment.getId())
+                        .orElseThrow(() -> new ApiException(
+                                HttpStatus.INTERNAL_SERVER_ERROR.value(),
+                                "Payment not found after processing"
+                        ));
 
         return toResponse(completedPayment);
     }
 
-    protected Payment claimPayment(
-            Long userId,
-            CreatePaymentRequest request,
-            String idempotencyKey
-    ) {
-
-        /*
-         * First check:
-         * Same idempotency key = same payment attempt.
-         */
-        var existingPayment =
-                paymentRepository.findByIdempotencyKey(idempotencyKey);
-
-        if (existingPayment.isPresent()) {
-
-            Payment payment = existingPayment.get();
-
-            validatePaymentOwnership(payment, userId);
-
-            return payment;
-        }
-
-        /*
-         * Lock the order.
-         *
-         * This is the important concurrency protection.
-         */
-        Order order = orderRepository
-                .findByIdForUpdate(request.orderId())
-                .orElseThrow(() -> new ApiException(
-                        HttpStatus.NOT_FOUND.value(),
-                        "Order not found"
-                ));
-
-        /*
-         * Verify that this order belongs to the logged-in user.
-         */
-        if (!order.getUserId().equals(userId)) {
-            throw new ApiException(
-                    HttpStatus.FORBIDDEN.value(),
-                    "You do not have access to this order"
-            );
-        }
-
-        /*
-         * Second idempotency check after acquiring the lock.
-         */
-        existingPayment =
-                paymentRepository.findByIdempotencyKey(idempotencyKey);
-
-        if (existingPayment.isPresent()) {
-            Payment payment = existingPayment.get();
-
-            validatePaymentOwnership(payment, userId);
-
-            return payment;
-        }
-
-        /*
-         * Order has already been successfully paid.
-         */
-        if (order.getStatus() == OrderStatus.CONFIRMED) {
-            throw new ApiException(
-                    HttpStatus.CONFLICT.value(),
-                    "Order is already paid"
-            );
-        }
-
-        /*
-         * Another payment is already being processed.
-         */
-        if (order.getStatus() == OrderStatus.PAYMENT_PENDING) {
-            throw new ApiException(
-                    HttpStatus.CONFLICT.value(),
-                    "Payment is already in progress for this order"
-            );
-        }
-
-        /*
-         * Only CREATED and PAYMENT_FAILED orders
-         * can start a new payment attempt.
-         */
-        if (order.getStatus() != OrderStatus.CREATED
-                && order.getStatus() != OrderStatus.PAYMENT_FAILED) {
-
-            throw new ApiException(
-                    HttpStatus.CONFLICT.value(),
-                    "Order cannot accept payment in current state"
-            );
-        }
-
-        /*
-         * Claim the order.
-         */
-        order.setStatus(OrderStatus.PAYMENT_PENDING);
-
-        orderRepository.save(order);
-
-        /*
-         * Create payment in IN_PROGRESS state.
-         */
-        Payment payment = new Payment();
-
-        payment.setOrderId(order.getId());
-        payment.setAmount(order.getAmount());
-        payment.setIdempotencyKey(idempotencyKey);
-        payment.setPaymentMethod(request.paymentMethod());
-        payment.setStatus(PaymentStatus.IN_PROGRESS);
-        payment.setCreatedAt(Instant.now());
-        payment.setUpdatedAt(Instant.now());
-
-        return paymentRepository.save(payment);
-    }
 
     public void processPayment(Long paymentId) {
 
@@ -217,41 +107,11 @@ public class PaymentService {
             boolean success,
             String providerReference
     ) {
-
-        Payment payment = paymentRepository
-                .findById(paymentId)
-                .orElseThrow(() -> new ApiException(
-                        HttpStatus.NOT_FOUND.value(),
-                        "Payment not found"
-                ));
-
-        /*
-         * Idempotent completion.
-         */
-        if (payment.getStatus() == PaymentStatus.SUCCESS
-                || payment.getStatus() == PaymentStatus.FAILURE) {
-            return;
-        }
-
-        Order order = orderRepository
-                .findByIdForUpdate(payment.getOrderId())
-                .orElseThrow(() -> new ApiException(
-                        HttpStatus.NOT_FOUND.value(),
-                        "Order not found"
-                ));
-
-        payment.setProviderReference(providerReference);
-
-        if (success) {
-            payment.setStatus(PaymentStatus.SUCCESS);
-            order.setStatus(OrderStatus.CONFIRMED);
-        } else {
-            payment.setStatus(PaymentStatus.FAILURE);
-            order.setStatus(OrderStatus.PAYMENT_FAILED);
-        }
-
-        paymentRepository.save(payment);
-        orderRepository.save(order);
+        paymentTransactionService.completePayment(
+                paymentId,
+                success,
+                providerReference
+        );
     }
 
     @Transactional

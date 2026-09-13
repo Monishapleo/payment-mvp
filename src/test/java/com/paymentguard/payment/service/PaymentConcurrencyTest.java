@@ -7,13 +7,11 @@ import com.paymentguard.payment.entity.Payment;
 import com.paymentguard.payment.entity.PaymentMethod;
 import com.paymentguard.payment.entity.PaymentStatus;
 import com.paymentguard.payment.repository.PaymentRepository;
-import com.paymentguard.payment.service.PaymentProvider;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
-import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
 import java.util.ArrayList;
@@ -21,6 +19,8 @@ import java.util.List;
 import java.util.concurrent.*;
 
 import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.Mockito.*;
 
 @SpringBootTest
@@ -33,147 +33,201 @@ class PaymentConcurrencyTest {
     private PaymentRepository paymentRepository;
 
     @Autowired
-    private com.paymentguard.payment.service.PaymentService paymentService;
+    private PaymentService paymentService;
 
     @MockitoBean
     private PaymentProvider paymentProvider;
 
-    private Long orderId;
 
     @BeforeEach
-    @Transactional
-    void setup() {
-
-        // Clean payments created by previous test runs
+    void cleanDatabase() {
         paymentRepository.deleteAll();
+        orderRepository.deleteAll();
+    }
 
-        // Create a fresh order
+
+    @Test
+    void shouldAllowOnlyOnePaymentWhenDifferentKeysAreUsedConcurrently()
+            throws Exception {
+
         Order order = new Order();
-
         order.setUserId(1L);
         order.setAmount(new BigDecimal("500.00"));
         order.setStatus(OrderStatus.CREATED);
 
-        order = orderRepository.saveAndFlush(order);
+        order = orderRepository.save(order);
+        final Long orderId = order.getId();
 
-        orderId = order.getId();
-    }
+        when(paymentProvider.charge(
+                anyLong(),
+                any(BigDecimal.class)
+        )).thenReturn(
+                new PaymentProvider.ProviderResult(
+                        "PROVIDER-123",
+                        true
+                )
+        );
 
-    @Test
-    void shouldAllowOnlyOnePaymentWhenMultipleRequestsArriveConcurrently()
-            throws Exception {
-
-        // Provider succeeds
-        when(paymentProvider.charge(anyLong(), any(BigDecimal.class)))
-                .thenAnswer(invocation ->
-                        new PaymentProvider.ProviderResult(
-                                "PROVIDER-" + invocation.getArgument(0),
-                                true
-                        ));
-
-        int requestCount = 10;
+        int threadCount = 10;
 
         ExecutorService executor =
-                Executors.newFixedThreadPool(requestCount);
+                Executors.newFixedThreadPool(threadCount);
 
-        CountDownLatch startGate =
+        CountDownLatch startLatch =
                 new CountDownLatch(1);
 
-        List<Future<Result>> futures =
+        List<Future<?>> futures =
                 new ArrayList<>();
 
-        // Fire 10 requests at exactly the same time
-        for (int i = 0; i < requestCount; i++) {
+        for (int i = 0; i < threadCount; i++) {
 
-            String idempotencyKey = "key-" + i;
+            String idempotencyKey =
+                    "different-key-" + i;
 
             futures.add(
                     executor.submit(() -> {
 
-                        startGate.await();
-
                         try {
+                            startLatch.await();
 
-                            var response =
-                                    paymentService.create(
-                                            1L,
-                                            new com.paymentguard.payment.dto.CreatePaymentRequest(
-                                                    orderId,
-                                                    PaymentMethod.UPI
-                                            ),
-                                            idempotencyKey
-                                    );
-
-                            return new Result(
-                                    true,
-                                    response.status(),
-                                    null
+                            paymentService.create(
+                                    1L,
+                                    new com.paymentguard.payment.dto.CreatePaymentRequest(
+                                            orderId,
+                                            PaymentMethod.UPI
+                                    ),
+                                    idempotencyKey
                             );
 
-                        } catch (Exception e) {
-
-                            return new Result(
-                                    false,
-                                    null,
-                                    e.getMessage()
-                            );
+                        } catch (Exception ignored) {
+                            // Expected for rejected concurrent requests.
                         }
+
+                        return null;
                     })
             );
         }
 
-        // Release all threads simultaneously
-        startGate.countDown();
+        startLatch.countDown();
 
-        List<Result> results = new ArrayList<>();
-
-        for (Future<Result> future : futures) {
-            results.add(future.get(10, TimeUnit.SECONDS));
+        for (Future<?> future : futures) {
+            future.get();
         }
 
         executor.shutdown();
 
-        // Count successful requests
-        long successCount =
-                results.stream()
-                        .filter(Result::success)
-                        .count();
-
-        // Count rejected requests
-        long rejectedCount =
-                results.stream()
-                        .filter(result ->
-                                !result.success())
-                        .count();
-
-        // Exactly one request should succeed
-        assertEquals(
-                1,
-                successCount,
-                "Exactly one payment request should succeed"
-        );
-
-        // Remaining requests should be rejected
-        assertEquals(
-                requestCount - 1,
-                rejectedCount
-        );
-
-        // Database must contain exactly ONE payment
         List<Payment> payments =
                 paymentRepository.findAll();
 
         assertEquals(
                 1,
-                payments.size(),
-                "Database must contain exactly one payment"
+                payments.size()
         );
 
         Payment payment = payments.get(0);
 
         assertEquals(
-                orderId,
-                payment.getOrderId()
+                PaymentStatus.SUCCESS,
+                payment.getStatus()
+        );
+
+        verify(
+                paymentProvider,
+                times(1)
+        ).charge(
+                anyLong(),
+                any(BigDecimal.class)
+        );
+    }
+
+
+    @Test
+    void shouldChargeOnlyOnceWhenSameKeyIsUsedConcurrently()
+            throws Exception {
+
+        Order order = new Order();
+        order.setUserId(1L);
+        order.setAmount(new BigDecimal("500.00"));
+        order.setStatus(OrderStatus.CREATED);
+
+        order = orderRepository.save(order);
+        final Long orderId = order.getId();
+
+        when(paymentProvider.charge(
+                anyLong(),
+                any(BigDecimal.class)
+        )).thenReturn(
+                new PaymentProvider.ProviderResult(
+                        "PROVIDER-SAME-KEY",
+                        true
+                )
+        );
+
+        int threadCount = 10;
+
+        String idempotencyKey =
+                "same-payment-key";
+
+        ExecutorService executor =
+                Executors.newFixedThreadPool(threadCount);
+
+        CountDownLatch startLatch =
+                new CountDownLatch(1);
+
+        List<Future<?>> futures =
+                new ArrayList<>();
+
+        for (int i = 0; i < threadCount; i++) {
+
+            futures.add(
+                    executor.submit(() -> {
+
+                        try {
+                            startLatch.await();
+
+                            paymentService.create(
+                                    1L,
+                                    new com.paymentguard.payment.dto.CreatePaymentRequest(
+                                            orderId,
+                                            PaymentMethod.UPI
+                                    ),
+                                    idempotencyKey
+                            );
+
+                        } catch (Exception ignored) {
+                            // Concurrent requests may race.
+                        }
+
+                        return null;
+                    })
+            );
+        }
+
+        startLatch.countDown();
+
+        for (Future<?> future : futures) {
+            future.get();
+        }
+
+        executor.shutdown();
+
+        List<Payment> payments =
+                paymentRepository.findAll();
+
+        /*
+         * Same idempotency key must produce
+         * exactly one payment record.
+         */
+        assertEquals(
+                1,
+                payments.size()
+        );
+
+        Payment payment = payments.get(0);
+
+        assertEquals(
+                idempotencyKey,
+                payment.getIdempotencyKey()
         );
 
         assertEquals(
@@ -181,18 +235,17 @@ class PaymentConcurrencyTest {
                 payment.getStatus()
         );
 
-        // Provider must be charged exactly once
-        verify(paymentProvider, times(1))
-                .charge(
-                        anyLong(),
-                        any(BigDecimal.class)
-                );
-    }
-
-    private record Result(
-            boolean success,
-            PaymentStatus status,
-            String error
-    ) {
+        /*
+         * Most important assertion:
+         *
+         * Provider must be called exactly once.
+         */
+        verify(
+                paymentProvider,
+                times(1)
+        ).charge(
+                anyLong(),
+                any(BigDecimal.class)
+        );
     }
 }

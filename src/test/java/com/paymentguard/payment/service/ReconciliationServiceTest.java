@@ -41,7 +41,7 @@ class ReconciliationServiceTest {
         when(paymentRepository.findAll())
                 .thenReturn(List.of(payment));
 
-        when(paymentProvider.getStatus("PROVIDER-123"))
+        when(paymentProvider.getStatus(payment.getId(),"PROVIDER-123"))
                 .thenReturn(
                         new PaymentProvider.ProviderResult(
                                 "PROVIDER-123",
@@ -54,7 +54,7 @@ class ReconciliationServiceTest {
 
         // Assert
         verify(paymentProvider)
-                .getStatus("PROVIDER-123");
+                .getStatus(payment.getId(),"PROVIDER-123");
 
         verify(paymentService)
                 .completePayment(
@@ -82,7 +82,7 @@ class ReconciliationServiceTest {
 
         // Assert
         verify(paymentProvider, never())
-                .getStatus(anyString());
+                .getStatus(anyLong(),anyString());
 
         verify(paymentService, never())
                 .completePayment(
